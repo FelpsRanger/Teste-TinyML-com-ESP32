@@ -1,0 +1,997 @@
+/*
+ * TinyML ESP32 - PlatformIO Implementation - OTIMIZADO PARA ENERGIA
+ * Reconhecimento de comandos de voz com foco extremo na economia de bateria
+ * Compatível com TensorFlow Lite Micro
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <driver/i2s.h>
+#include <esp_timer.h>
+#include <esp_system.h>
+#include <esp_log.h>
+#include <driver/rtc_io.h>
+#include <soc/rtc.h>
+#include <esp_pm.h>
+#include <driver/adc.h>
+
+// Configurações do projeto
+#include "config.h"
+
+// TensorFlow Lite Micro (se disponível)
+#ifdef ARDUINO_TENSORFLOW_LITE
+    #include "TensorFlowLite_ESP32.h"
+    #include "tensorflow/lite/micro/all_ops_resolver.h"
+    #include "tensorflow/lite/micro/micro_error_reporter.h"
+    #include "tensorflow/lite/micro/micro_interpreter.h"
+    #include "tensorflow/lite/schema/schema_generated.h"
+    #define TFLITE_AVAILABLE 1
+#else
+    #define TFLITE_AVAILABLE 0
+    #warning "TensorFlow Lite não disponível - usando simulação"
+#endif
+
+// ================== CONFIGURAÇÕES DE ECONOMIA DE ENERGIA ==================
+#define ENERGY_ULTRA_SAVE_MODE      1        // Modo ultra economia ativado
+#define ADAPTIVE_SAMPLING           1        // Amostragem adaptativa
+#define SMART_WAKE_UP               1        // Wake-up inteligente
+#define BATTERY_MONITORING          1        // Monitoramento de bateria
+
+// Parâmetros de economia otimizados
+#define VOICE_DETECTION_THRESHOLD   0.002f   // Threshold mais sensível
+#define SILENCE_TIMEOUT_MS          2000     // Timeout reduzido para silêncio
+#define DEEP_SLEEP_TIMEOUT_MS       5000     // Deep sleep mais agressivo
+#define LIGHT_SLEEP_TIMEOUT_MS      500      // Light sleep rápido
+#define INFERENCE_SKIP_COUNT        3        // Pular inferências em silêncio
+
+// Configurações adaptativas do microfone
+#define MIC_LOW_POWER_SAMPLE_RATE   8000     // Sample rate reduzido
+#define MIC_NORMAL_SAMPLE_RATE      16000    // Sample rate normal
+#define MIC_BUFFER_REDUCTION        4        // Redução do buffer em economia
+
+// Configurações de bateria
+#define BATTERY_ADC_PIN             36       // Pin do ADC para bateria
+#define BATTERY_LOW_VOLTAGE         3.3f     // Tensão baixa (V)
+#define BATTERY_CRITICAL_VOLTAGE    3.0f     // Tensão crítica (V)
+
+// ================== DADOS DO MODELO OTIMIZADO ==================
+// Modelo menor e mais eficiente para economia de energia
+const unsigned char energy_optimized_model[] = {
+    0x18, 0x00, 0x00, 0x00, 0x54, 0x46, 0x4c, 0x33,
+    // ... modelo otimizado (menor precisão, maior eficiência)
+    0x00, 0x00, 0x00, 0x00  // Modelo vazio para compilação
+};
+const int energy_model_len = sizeof(energy_optimized_model);
+
+// ================== ESTRUTURAS DE DADOS OTIMIZADAS ==================
+typedef enum {
+    ENERGY_ACTIVE = 0,        // Modo ativo (alta performance)
+    ENERGY_BALANCED,          // Modo balanceado
+    ENERGY_ECO,              // Modo econômico
+    ENERGY_ULTRA_ECO,        // Modo ultra econômico
+    ENERGY_DEEP_SLEEP        // Deep sleep
+} EnergyMode;
+
+typedef enum {
+    BATTERY_FULL = 0,        // >90%
+    BATTERY_GOOD,            // 50-90%
+    BATTERY_LOW,             // 20-50%
+    BATTERY_CRITICAL         // <20%
+} BatteryLevel;
+
+typedef struct {
+    uint32_t inference_time_us;
+    uint32_t mic_active_time_ms;
+    uint32_t total_sleep_time_ms;
+    float power_consumption_mw;
+    float battery_voltage;
+    BatteryLevel battery_level;
+    float confidence;
+    int predicted_class;
+    bool voice_detected;
+    uint32_t total_inferences;
+    uint32_t skipped_inferences;
+    uint8_t consecutive_silence;
+} energy_metrics_t;
+
+// ================== CLASSE PRINCIPAL OTIMIZADA ==================
+class EnergyOptimizedVoiceML {
+private:
+    // Buffers adaptativos
+    int16_t* audio_buffer;
+    float* preprocessed_audio;
+    uint32_t current_buffer_size;
+    uint32_t current_sample_rate;
+    
+    // Sistema de economia de energia
+    energy_metrics_t metrics;
+    EnergyMode current_energy_mode;
+    unsigned long last_activity_time;
+    unsigned long last_voice_time;
+    unsigned long mic_start_time;
+    
+    // Estados de economia
+    bool mic_active;
+    bool i2s_installed;
+    bool adaptive_mode_enabled;
+    uint8_t inference_skip_counter;
+    
+    // TensorFlow Lite otimizado
+    #if TFLITE_AVAILABLE
+    tflite::MicroErrorReporter error_reporter;
+    tflite::AllOpsResolver resolver;
+    const tflite::Model* model;
+    tflite::MicroInterpreter* interpreter;
+    TfLiteTensor* input_tensor;
+    TfLiteTensor* output_tensor;
+    uint8_t* tensor_arena;
+    bool model_loaded;
+    #endif
+    
+public:
+    EnergyOptimizedVoiceML() {
+        // Inicializar com tamanhos adaptativos
+        current_buffer_size = AUDIO_BUFFER_SIZE / MIC_BUFFER_REDUCTION;
+        current_sample_rate = MIC_LOW_POWER_SAMPLE_RATE;
+        
+        audio_buffer = (int16_t*)heap_caps_malloc(AUDIO_BUFFER_SIZE * sizeof(int16_t), MALLOC_CAP_DMA);
+        preprocessed_audio = (float*)malloc(INPUT_FEATURES * sizeof(float));
+        
+        #if TFLITE_AVAILABLE
+        // Arena menor para economia de energia
+        uint32_t arena_size = TENSOR_ARENA_SIZE / 2;
+        tensor_arena = (uint8_t*)heap_caps_malloc(arena_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        model_loaded = false;
+        #endif
+        
+        // Inicializar estados
+        memset(&metrics, 0, sizeof(energy_metrics_t));
+        current_energy_mode = ENERGY_ULTRA_ECO;
+        mic_active = false;
+        i2s_installed = false;
+        adaptive_mode_enabled = true;
+        inference_skip_counter = 0;
+        
+        last_activity_time = millis();
+        last_voice_time = millis();
+    }
+    
+    ~EnergyOptimizedVoiceML() {
+        cleanup_resources();
+    }
+    
+    bool initialize() {
+        Serial.begin(SERIAL_BAUD_RATE);
+        delay(500); // Delay reduzido
+        
+        DEBUG_PRINTLN("🌱 Inicializando TinyML Voice Recognition - MODO ECO");
+        
+        // Configurar gerenciamento de energia do ESP32
+        setup_power_management();
+        
+        // Verificar bateria
+        #if BATTERY_MONITORING
+        setup_battery_monitoring();
+        update_battery_status();
+        #endif
+        
+        // Configurar pinos para economia
+        setup_energy_efficient_pins();
+        
+        // Inicializar TensorFlow Lite com modelo otimizado
+        #if TFLITE_AVAILABLE
+        if (!setup_energy_tensorflow()) {
+            DEBUG_PRINTLN("⚠️ TensorFlow Lite em modo degradado");
+        }
+        #endif
+        
+        // Começar em modo ultra econômico
+        set_energy_mode(ENERGY_ULTRA_ECO);
+        
+        DEBUG_PRINTLN("✅ Sistema ECO inicializado!");
+        print_energy_info();
+        
+        return true;
+    }
+    
+    void run() {
+        unsigned long current_time = millis();
+        
+        // Atualizar status da bateria periodicamente
+        static unsigned long last_battery_check = 0;
+        if (current_time - last_battery_check > 30000) { // 30s
+            #if BATTERY_MONITORING
+            update_battery_status();
+            #endif
+            last_battery_check = current_time;
+        }
+        
+        // Gerenciamento inteligente de energia
+        manage_energy_modes(current_time);
+        
+        // Processar áudio apenas quando necessário
+        if (should_process_audio(current_time)) {
+            if (smart_audio_capture()) {
+                if (preprocess_audio_efficient()) {
+                    if (should_run_inference()) {
+                        if (run_energy_inference()) {
+                            process_results_efficient();
+                            metrics.total_inferences++;
+                            last_activity_time = current_time;
+                        }
+                    } else {
+                        metrics.skipped_inferences++;
+                    }
+                }
+            }
+        }
+        
+        // Relatório de energia
+        static unsigned long last_energy_report = 0;
+        if (current_time - last_energy_report > 15000) { // 15 segundos
+            print_energy_report();
+            last_energy_report = current_time;
+        }
+        
+        // Sleep adaptativo
+        adaptive_sleep();
+    }
+    
+private:
+    void setup_power_management() {
+        // Configurar PM (Power Management) do ESP32
+        esp_pm_config_esp32_t pm_config = {
+            .max_freq_mhz = 80,  // Frequência máxima reduzida
+            .min_freq_mhz = 10,  // Frequência mínima para economia
+            .light_sleep_enable = true
+        };
+        
+        esp_pm_configure(&pm_config);
+        
+        // Desabilitar WiFi para economia extrema
+        WiFi.mode(WIFI_OFF);
+        btStop();
+        
+        DEBUG_PRINTLN("🔋 Power Management configurado");
+    }
+    
+    #if BATTERY_MONITORING
+    void setup_battery_monitoring() {
+        adc1_config_width(ADC_WIDTH_BIT_12);
+        adc1_config_channel_atten(ADC1_CHANNEL_0, ADC_ATTEN_DB_11);
+        DEBUG_PRINTLN("🔋 Monitoramento de bateria ativo");
+    }
+    
+    void update_battery_status() {
+        // Ler voltagem da bateria
+        uint32_t adc_reading = adc1_get_raw(ADC1_CHANNEL_0);
+        metrics.battery_voltage = (adc_reading * 3.3 * 2.0) / 4095.0; // Divisor de tensão
+        
+        // Determinar nível da bateria
+        if (metrics.battery_voltage > 4.0f) {
+            metrics.battery_level = BATTERY_FULL;
+        } else if (metrics.battery_voltage > 3.7f) {
+            metrics.battery_level = BATTERY_GOOD;
+        } else if (metrics.battery_voltage > BATTERY_LOW_VOLTAGE) {
+            metrics.battery_level = BATTERY_LOW;
+        } else {
+            metrics.battery_level = BATTERY_CRITICAL;
+        }
+        
+        // Ajustar comportamento baseado na bateria
+        if (metrics.battery_level == BATTERY_CRITICAL) {
+            set_energy_mode(ENERGY_DEEP_SLEEP);
+        } else if (metrics.battery_level == BATTERY_LOW) {
+            set_energy_mode(ENERGY_ULTRA_ECO);
+        }
+    }
+    #endif
+    
+    void setup_energy_efficient_pins() {
+        // LED apenas para indicações críticas
+        pinMode(LED_PIN, OUTPUT);
+        digitalWrite(LED_PIN, LOW);
+        
+        // Botão com wake-up
+        pinMode(BUTTON_PIN, INPUT_PULLUP);
+        
+        // Configurar wake-up por GPIO
+        esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0); // Botão como wake-up
+        
+        DEBUG_PRINTLN("📌 Pinos configurados para economia");
+    }
+    
+    void set_energy_mode(EnergyMode mode) {
+        if (current_energy_mode == mode) return;
+        
+        current_energy_mode = mode;
+        
+        switch (mode) {
+            case ENERGY_ACTIVE:
+                setCpuFrequencyMhz(240);
+                current_sample_rate = AUDIO_SAMPLE_RATE;
+                current_buffer_size = AUDIO_BUFFER_SIZE;
+                metrics.power_consumption_mw = 180.0f;
+                DEBUG_PRINTLN("🔥 Modo ATIVO");
+                break;
+                
+            case ENERGY_BALANCED:
+                setCpuFrequencyMhz(160);
+                current_sample_rate = MIC_NORMAL_SAMPLE_RATE;
+                current_buffer_size = AUDIO_BUFFER_SIZE / 2;
+                metrics.power_consumption_mw = 120.0f;
+                DEBUG_PRINTLN("⚖️ Modo BALANCEADO");
+                break;
+                
+            case ENERGY_ECO:
+                setCpuFrequencyMhz(80);
+                current_sample_rate = MIC_LOW_POWER_SAMPLE_RATE;
+                current_buffer_size = AUDIO_BUFFER_SIZE / 4;
+                metrics.power_consumption_mw = 60.0f;
+                DEBUG_PRINTLN("🌿 Modo ECO");
+                break;
+                
+            case ENERGY_ULTRA_ECO:
+                setCpuFrequencyMhz(40);
+                current_sample_rate = MIC_LOW_POWER_SAMPLE_RATE;
+                current_buffer_size = AUDIO_BUFFER_SIZE / 8;
+                metrics.power_consumption_mw = 25.0f;
+                DEBUG_PRINTLN("🍃 Modo ULTRA ECO");
+                break;
+                
+            case ENERGY_DEEP_SLEEP:
+                cleanup_resources();
+                DEBUG_PRINTLN("😴 Entrando em Deep Sleep...");
+                esp_deep_sleep_start();
+                break;
+        }
+        
+        // Reconfigurar I2S se necessário
+        if (mic_active) {
+            reconfigure_i2s();
+        }
+    }
+    
+    void manage_energy_modes(unsigned long current_time) {
+        unsigned long idle_time = current_time - last_activity_time;
+        unsigned long voice_idle_time = current_time - last_voice_time;
+        
+        // Botão forçar modo ativo
+        if (digitalRead(BUTTON_PIN) == LOW) {
+            set_energy_mode(ENERGY_ACTIVE);
+            last_activity_time = current_time;
+            return;
+        }
+        
+        // Lógica adaptativa baseada em atividade e bateria
+        if (metrics.voice_detected) {
+            last_voice_time = current_time;
+            if (current_energy_mode > ENERGY_BALANCED) {
+                set_energy_mode(ENERGY_BALANCED);
+            }
+        } else if (voice_idle_time > DEEP_SLEEP_TIMEOUT_MS) {
+            if (metrics.battery_level <= BATTERY_LOW) {
+                set_energy_mode(ENERGY_DEEP_SLEEP);
+            } else {
+                set_energy_mode(ENERGY_ULTRA_ECO);
+            }
+        } else if (idle_time > SILENCE_TIMEOUT_MS) {
+            if (current_energy_mode < ENERGY_ECO) {
+                set_energy_mode(ENERGY_ECO);
+            }
+        }
+    }
+    
+    bool should_process_audio(unsigned long current_time) {
+        // Processar sempre em modo ativo
+        if (current_energy_mode == ENERGY_ACTIVE) {
+            return true;
+        }
+        
+        // Em modos econômicos, processar com intervalos maiores
+        static unsigned long last_audio_process = 0;
+        unsigned long interval = 100; // Default 100ms
+        
+        switch (current_energy_mode) {
+            case ENERGY_ECO:
+                interval = 200;
+                break;
+            case ENERGY_ULTRA_ECO:
+                interval = 500;
+                break;
+            default:
+                break;
+        }
+        
+        if (current_time - last_audio_process >= interval) {
+            last_audio_process = current_time;
+            return true;
+        }
+        
+        return false;
+    }
+    
+    bool smart_audio_capture() {
+        if (!ensure_mic_active()) {
+            return false;
+        }
+        
+        mic_start_time = millis();
+        
+        size_t bytes_read = 0;
+        size_t buffer_bytes = current_buffer_size * sizeof(int16_t);
+        
+        esp_err_t result = i2s_read(I2S_NUM_0, audio_buffer, buffer_bytes, 
+                                   &bytes_read, pdMS_TO_TICKS(50)); // Timeout reduzido
+        
+        metrics.mic_active_time_ms += (millis() - mic_start_time);
+        
+        if (result != ESP_OK || bytes_read == 0) {
+            return false;
+        }
+        
+        // Preencher com zeros se necessário
+        int samples_read = bytes_read / sizeof(int16_t);
+        if (samples_read < current_buffer_size) {
+            memset(&audio_buffer[samples_read], 0, 
+                   (current_buffer_size - samples_read) * sizeof(int16_t));
+        }
+        
+        return true;
+    }
+    
+    bool ensure_mic_active() {
+        if (mic_active) return true;
+        
+        if (!setup_adaptive_i2s()) {
+            DEBUG_PRINTLN("❌ Falha ao ativar microfone");
+            return false;
+        }
+        
+        mic_active = true;
+        return true;
+    }
+    
+    bool setup_adaptive_i2s() {
+        if (i2s_installed) {
+            i2s_driver_uninstall(I2S_NUM_0);
+            i2s_installed = false;
+        }
+        
+        i2s_config_t i2s_config = {
+            .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+            .sample_rate = current_sample_rate,
+            .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+            .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+            .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+            .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+            .dma_buf_count = 2, // Reduzido para economia
+            .dma_buf_len = 256, // Buffer menor
+            .use_apll = false,  // APLL desabilitado para economia
+            .tx_desc_auto_clear = false,
+            .fixed_mclk = 0
+        };
+        
+        i2s_pin_config_t pin_config = {
+            .bck_io_num = I2S_SCK_PIN,
+            .ws_io_num = I2S_WS_PIN,
+            .data_out_num = I2S_PIN_NO_CHANGE,
+            .data_in_num = I2S_SD_PIN
+        };
+        
+        esp_err_t result = i2s_driver_install(I2S_NUM_0, &i2s_config, 0, NULL);
+        if (result != ESP_OK) return false;
+        
+        result = i2s_set_pin(I2S_NUM_0, &pin_config);
+        if (result != ESP_OK) return false;
+        
+        i2s_installed = true;
+        return true;
+    }
+    
+    void reconfigure_i2s() {
+        if (mic_active) {
+            mic_active = false;
+            setup_adaptive_i2s();
+            mic_active = true;
+        }
+    }
+    
+    bool preprocess_audio_efficient() {
+        if (!preprocessed_audio) return false;
+        
+        // VAD otimizado para economia de energia
+        float energy = 0.0f;
+        int samples_to_process = MIN(current_buffer_size, INPUT_FEATURES);
+        
+        for (int i = 0; i < samples_to_process; i++) {
+            float sample = audio_buffer[i] / 32768.0f;
+            energy += sample * sample;
+            
+            // Processamento simplificado para economia
+            preprocessed_audio[i] = sample * 0.5f; // Sem janela de Hamming em modo eco
+        }
+        
+        energy = energy / samples_to_process;
+        metrics.voice_detected = energy > VOICE_DETECTION_THRESHOLD;
+        
+        // Atualizar contador de silêncio
+        if (!metrics.voice_detected) {
+            metrics.consecutive_silence++;
+            if (metrics.consecutive_silence > 10) {
+                // Desativar microfone temporariamente após muito silêncio
+                mic_active = false;
+                if (i2s_installed) {
+                    i2s_driver_uninstall(I2S_NUM_0);
+                    i2s_installed = false;
+                }
+            }
+        } else {
+            metrics.consecutive_silence = 0;
+        }
+        
+        // Preencher resto com zeros
+        for (int i = samples_to_process; i < INPUT_FEATURES; i++) {
+            preprocessed_audio[i] = 0.0f;
+        }
+        
+        return metrics.voice_detected;
+    }
+    
+    bool should_run_inference() {
+        // Sempre inferir em modo ativo
+        if (current_energy_mode == ENERGY_ACTIVE) {
+            return true;
+        }
+        
+        // Pular inferências em silêncio para economia
+        if (!metrics.voice_detected) {
+            inference_skip_counter++;
+            if (inference_skip_counter < INFERENCE_SKIP_COUNT) {
+                return false;
+            }
+        }
+        
+        inference_skip_counter = 0;
+        return true;
+    }
+    
+    #if TFLITE_AVAILABLE
+    bool setup_energy_tensorflow() {
+        if (!tensor_arena) {
+            DEBUG_PRINTLN("❌ Arena não disponível");
+            return false;
+        }
+        
+        // Usar modelo otimizado para energia
+        model = tflite::GetModel(energy_optimized_model);
+        if (model->version() != TFLITE_SCHEMA_VERSION) {
+            DEBUG_PRINTLN("❌ Versão incompatível");
+            return false;
+        }
+        
+        // Criar interpretador com arena reduzida
+        uint32_t arena_size = TENSOR_ARENA_SIZE / 2;
+        interpreter = new tflite::MicroInterpreter(
+            model, resolver, tensor_arena, arena_size, &error_reporter);
+        
+        if (interpreter->AllocateTensors() != kTfLiteOk) {
+            DEBUG_PRINTLN("❌ Falha na alocação");
+            return false;
+        }
+        
+        input_tensor = interpreter->input(0);
+        output_tensor = interpreter->output(0);
+        model_loaded = true;
+        
+        DEBUG_PRINTLN("✅ TensorFlow Lite ECO ativo");
+        return true;
+    }
+    #endif
+    
+    bool run_energy_inference() {
+        unsigned long start_time = micros();
+        
+        #if TFLITE_AVAILABLE
+        if (!model_loaded) {
+            // Inferência simulada mais eficiente
+            delay(1);
+            metrics.predicted_class = CLASS_SILENCE;
+            metrics.confidence = 0.8f;
+        } else {
+            // Copiar apenas dados necessários
+            int features_to_copy = MIN(INPUT_FEATURES, current_buffer_size);
+            for (int i = 0; i < features_to_copy; i++) {
+                input_tensor->data.f[i] = preprocessed_audio[i];
+            }
+            
+            // Executar inferência otimizada
+            if (interpreter->Invoke() != kTfLiteOk) {
+                return false;
+            }
+            
+            // Processar saída
+            float max_prob = output_tensor->data.f[0];
+            int predicted = 0;
+            for (int i = 1; i < OUTPUT_CLASSES; i++) {
+                if (output_tensor->data.f[i] > max_prob) {
+                    max_prob = output_tensor->data.f[i];
+                    predicted = i;
+                }
+            }
+            
+            metrics.predicted_class = predicted;
+            metrics.confidence = max_prob;
+        }
+        #else
+        // Simulação eficiente
+        metrics.predicted_class = metrics.voice_detected ? 1 : 0;
+        metrics.confidence = 0.75f;
+        #endif
+        
+        metrics.inference_time_us = micros() - start_time;
+        return true;
+    }
+    
+    void process_results_efficient() {
+        // Processar apenas resultados com alta confiança
+        if (metrics.confidence > CONFIDENCE_THRESHOLD) {
+            const char* labels[] = {"🔇", "❓", "✅", "❌"};
+            
+            // LED apenas para detecções importantes
+            if (metrics.predicted_class > 0) {
+                digitalWrite(LED_PIN, HIGH);
+                delay(50); // Flash rápido
+                digitalWrite(LED_PIN, LOW);
+            }
+            
+            DEBUG_PRINTF("🎯 %s (%.0f%%)\n", 
+                        labels[metrics.predicted_class], 
+                        metrics.confidence * 100);
+        }
+    }
+    
+    void adaptive_sleep() {
+        unsigned long sleep_time = 10; // Default 10ms
+        
+        switch (current_energy_mode) {
+            case ENERGY_ACTIVE:
+                sleep_time = 5;
+                break;
+            case ENERGY_BALANCED:
+                sleep_time = 10;
+                break;
+            case ENERGY_ECO:
+                sleep_time = 50;
+                break;
+            case ENERGY_ULTRA_ECO:
+                sleep_time = 100;
+                // Light sleep para economia extrema
+                if (!metrics.voice_detected && metrics.consecutive_silence > 5) {
+                    esp_sleep_enable_timer_wakeup(sleep_time * 1000);
+                    esp_light_sleep_start();
+                    metrics.total_sleep_time_ms += sleep_time;
+                    return;
+                }
+                break;
+            default:
+                break;
+        }
+        
+        delay(sleep_time);
+    }
+    
+    void cleanup_resources() {
+        if (mic_active && i2s_installed) {
+            i2s_driver_uninstall(I2S_NUM_0);
+            i2s_installed = false;
+        }
+        mic_active = false;
+        
+        free(audio_buffer);
+        free(preprocessed_audio);
+        #if TFLITE_AVAILABLE
+        free(tensor_arena);
+        delete interpreter;
+        #endif
+    }
+    
+    void print_energy_report() {
+        if (metrics.total_inferences == 0 && metrics.skipped_inferences == 0) return;
+        
+        float efficiency = (float)metrics.total_inferences / 
+                          (metrics.total_inferences + metrics.skipped_inferences) * 100;
+        
+        DEBUG_PRINTLN("\n🔋 RELATÓRIO DE ENERGIA:");
+        DEBUG_PRINTF("   🎯 Inferências: %lu (%.1f%% eficiência)\n", 
+                    metrics.total_inferences, efficiency);
+        DEBUG_PRINTF("   ⏭️ Puladas: %lu\n", metrics.skipped_inferences);
+        DEBUG_PRINTF("   ⏱️ Latência: %lu μs\n", metrics.inference_time_us);
+        DEBUG_PRINTF("   🎤 Mic ativo: %lu ms\n", metrics.mic_active_time_ms);
+        DEBUG_PRINTF("   😴 Sleep total: %lu ms\n", metrics.total_sleep_time_ms);
+        DEBUG_PRINTF("   ⚡ Potência: %.1f mW\n", metrics.power_consumption_mw);
+        
+        #if BATTERY_MONITORING
+        DEBUG_PRINTF("   🔋 Bateria: %.2fV ", metrics.battery_voltage);
+        const char* bat_labels[] = {"FULL", "GOOD", "LOW", "CRITICAL"};
+        DEBUG_PRINTF("(%s)\n", bat_labels[metrics.battery_level]);
+        #endif
+        
+        DEBUG_PRINTF("   💾 RAM livre: %d KB\n", ESP.getFreeHeap() / 1024);
+    }
+    
+    void print_energy_info() {
+        DEBUG_PRINTLN("\n🌱 CONFIGURAÇÃO DE ECONOMIA:");
+        DEBUG_PRINTF("   🔋 Modo atual: ULTRA ECO\n");
+        DEBUG_PRINTF("   🎤 Sample rate: %d Hz\n", current_sample_rate);
+        DEBUG_PRINTF("   📊 Buffer: %d samples\n", current_buffer_size);
+        DEBUG_PRINTF("   ⚡ Potência estimada: %.1f mW\n", metrics.power_consumption_mw);
+        DEBUG_PRINTF("   😴 Light sleep: ATIVO\n");
+        DEBUG_PRINTF("   🎯 VAD threshold: %.4f\n", VOICE_DETECTION_THRESHOLD);
+        #if BATTERY_MONITORING
+        DEBUG_PRINTF("   🔋 Monitoramento: ATIVO\n");
+        #endif
+        DEBUG_PRINTLN();
+    }
+};
+
+// ================== INSTÂNCIA GLOBAL ==================
+EnergyOptimizedVoiceML* energy_voice_ml = nullptr;
+
+// ================== SETUP E LOOP OTIMIZADOS ==================
+void setup() {
+    // Criar instância otimizada
+    energy_voice_ml = new EnergyOptimizedVoiceML();
+    
+    if (!energy_voice_ml->initialize()) {
+        Serial.println("❌ Falha na inicialização ECO!");
+        
+        // Sinal de erro econômico
+        for (int i = 0; i < 3; i++) {
+            digitalWrite(LED_PIN, HIGH);
+            delay(100);
+            digitalWrite(LED_PIN, LOW);
+            delay(100);
+        }
+        
+        // Entrar em deep sleep para economizar energia
+        esp_deep_sleep_start();
+    }
+}
+
+void loop() {
+    if (energy_voice_ml) {
+        energy_voice_ml->run();
+    } else {
+        // Fallback: deep sleep se instância falhou
+        DEBUG_PRINTLN("❌ Instância inválida - Deep sleep");
+        esp_deep_sleep_start();
+    }
+}
+
+// ================== FUNÇÕES AUXILIARES DE ECONOMIA ==================
+
+// Callback para wake-up otimizado
+void IRAM_ATTR wake_up_callback() {
+    // Wake-up rápido e eficiente
+    Serial.println("⚡ Wake-up detectado!");
+}
+
+// Função para verificar razão do wake-up
+void check_wakeup_reason() {
+    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+    
+    switch (wakeup_reason) {
+        case ESP_SLEEP_WAKEUP_EXT0:
+            DEBUG_PRINTLN("🔘 Wake-up por botão");
+            break;
+        case ESP_SLEEP_WAKEUP_TIMER:
+            DEBUG_PRINTLN("⏰ Wake-up por timer");
+            break;
+        case ESP_SLEEP_WAKEUP_TOUCHPAD:
+            DEBUG_PRINTLN("👆 Wake-up por touch");
+            break;
+        default:
+            DEBUG_PRINTLN("🔄 Reset ou primeira inicialização");
+            break;
+    }
+}
+
+// ================== CONFIGURAÇÕES ADICIONAIS DE ECONOMIA ==================
+
+// Função para configurar peripherals para máxima economia
+void configure_ultra_low_power() {
+    // Desabilitar peripherals desnecessários
+    periph_module_disable(PERIPH_LEDC_MODULE);
+    periph_module_disable(PERIPH_UART1_MODULE);
+    periph_module_disable(PERIPH_UART2_MODULE);
+    periph_module_disable(PERIPH_I2C0_MODULE);
+    periph_module_disable(PERIPH_I2C1_MODULE);
+    periph_module_disable(PERIPH_SPI_MODULE);
+    periph_module_disable(PERIPH_SPI2_MODULE);
+    periph_module_disable(PERIPH_SPI3_MODULE);
+    
+    // Configurar GPIO para consumo mínimo
+    for (int i = 0; i <= 39; i++) {
+        if (i != LED_PIN && i != BUTTON_PIN && 
+            i != I2S_SCK_PIN && i != I2S_WS_PIN && i != I2S_SD_PIN) {
+            pinMode(i, INPUT);
+            digitalWrite(i, LOW);
+        }
+    }
+    
+    DEBUG_PRINTLN("🔌 Peripherals configurados para economia máxima");
+}
+
+// Função para otimização dinâmica baseada no uso
+void dynamic_optimization() {
+    static uint32_t optimization_counter = 0;
+    optimization_counter++;
+    
+    // A cada 100 ciclos, otimizar uso de memória
+    if (optimization_counter % 100 == 0) {
+        // Garbage collection manual (se necessário)
+        ESP.restart(); // Reset periódico para limpeza de memória
+    }
+    
+    // A cada 50 ciclos, verificar e ajustar frequência
+    if (optimization_counter % 50 == 0) {
+        uint32_t free_heap = ESP.getFreeHeap();
+        if (free_heap < 50000) { // Menos que 50KB livre
+            DEBUG_PRINTLN("⚠️ Memória baixa - otimizando...");
+            // Reduzir buffers ou reiniciar
+        }
+    }
+}
+
+// ================== SISTEMA DE WATCHDOG PARA ECONOMIA ==================
+
+// Configurar watchdog para evitar travamentos que consomem energia
+void setup_energy_watchdog() {
+    esp_task_wdt_init(30, true); // 30 segundos timeout
+    esp_task_wdt_add(NULL);
+    DEBUG_PRINTLN("🐕 Watchdog de energia ativo");
+}
+
+void feed_energy_watchdog() {
+    esp_task_wdt_reset();
+}
+
+// ================== CALIBRAÇÃO AUTOMÁTICA DE ENERGIA ==================
+
+class EnergyCalibrator {
+private:
+    float baseline_consumption;
+    uint32_t calibration_samples;
+    bool calibrated;
+    
+public:
+    EnergyCalibrator() : baseline_consumption(0), calibration_samples(0), calibrated(false) {}
+    
+    void add_sample(float consumption) {
+        if (calibration_samples < 100) {
+            baseline_consumption += consumption;
+            calibration_samples++;
+            
+            if (calibration_samples == 100) {
+                baseline_consumption /= 100;
+                calibrated = true;
+                DEBUG_PRINTF("🎯 Calibração concluída: %.1f mW baseline\n", baseline_consumption);
+            }
+        }
+    }
+    
+    bool is_calibrated() { return calibrated; }
+    float get_baseline() { return baseline_consumption; }
+    
+    float calculate_efficiency(float current_consumption) {
+        if (!calibrated) return 0;
+        return (baseline_consumption / current_consumption) * 100;
+    }
+};
+
+// ================== SISTEMA DE PROFILES DE ENERGIA ==================
+
+typedef struct {
+    const char* name;
+    uint32_t cpu_freq;
+    uint32_t sample_rate;
+    uint32_t buffer_divisor;
+    uint32_t sleep_interval;
+    float expected_power_mw;
+} energy_profile_t;
+
+const energy_profile_t energy_profiles[] = {
+    {"PERFORMANCE", 240, 16000, 1, 5, 180.0f},
+    {"BALANCED", 160, 16000, 2, 10, 120.0f},
+    {"ECO", 80, 8000, 4, 50, 60.0f},
+    {"ULTRA_ECO", 40, 8000, 8, 100, 25.0f},
+    {"SURVIVAL", 20, 4000, 16, 500, 15.0f}
+};
+
+void apply_energy_profile(int profile_index) {
+    if (profile_index < 0 || profile_index >= sizeof(energy_profiles)/sizeof(energy_profile_t)) {
+        return;
+    }
+    
+    const energy_profile_t* profile = &energy_profiles[profile_index];
+    
+    setCpuFrequencyMhz(profile->cpu_freq);
+    
+    DEBUG_PRINTF("📊 Perfil aplicado: %s\n", profile->name);
+    DEBUG_PRINTF("   CPU: %d MHz\n", profile->cpu_freq);
+    DEBUG_PRINTF("   Sample Rate: %d Hz\n", profile->sample_rate);
+    DEBUG_PRINTF("   Potência estimada: %.1f mW\n", profile->expected_power_mw);
+}
+
+// ================== MONITORAMENTO DE TEMPERATURA PARA ECONOMIA ==================
+
+#ifdef CONFIG_IDF_TARGET_ESP32S3
+#include "driver/temp_sensor.h"
+
+void monitor_temperature_for_power() {
+    temp_sensor_config_t temp_config = {
+        .dac_offset = TSENS_DAC_L2,
+        .clk_div = 6
+    };
+    
+    temp_sensor_set_config(temp_config);
+    temp_sensor_start();
+    
+    float temperature;
+    if (temp_sensor_read_celsius(&temperature) == ESP_OK) {
+        DEBUG_PRINTF("🌡️ Temperatura: %.1f°C\n", temperature);
+        
+        // Reduzir frequência se muito quente
+        if (temperature > 70.0f) {
+            DEBUG_PRINTLN("🔥 Temperatura alta - reduzindo performance");
+            setCpuFrequencyMhz(80);
+        }
+    }
+    
+    temp_sensor_stop();
+}
+#endif
+
+// ================== ESTATÍSTICAS AVANÇADAS DE ENERGIA ==================
+
+typedef struct {
+    uint32_t total_runtime_ms;
+    uint32_t active_time_ms;
+    uint32_t sleep_time_ms;
+    uint32_t deep_sleep_count;
+    float average_power_mw;
+    float peak_power_mw;
+    float energy_consumed_mwh;
+    uint32_t battery_cycles;
+} advanced_energy_stats_t;
+
+advanced_energy_stats_t energy_stats = {0};
+
+void update_energy_statistics(float current_power, uint32_t duration_ms) {
+    energy_stats.total_runtime_ms += duration_ms;
+    energy_stats.active_time_ms += duration_ms;
+    
+    // Calcular consumo de energia
+    float energy_increment = (current_power * duration_ms) / 3600000.0f; // mWh
+    energy_stats.energy_consumed_mwh += energy_increment;
+    
+    // Atualizar médias
+    energy_stats.average_power_mw = (energy_stats.average_power_mw * 0.9f) + (current_power * 0.1f);
+    
+    if (current_power > energy_stats.peak_power_mw) {
+        energy_stats.peak_power_mw = current_power;
+    }
+}
+
+void print_advanced_energy_stats() {
+    DEBUG_PRINTLN("\n📈 ESTATÍSTICAS AVANÇADAS DE ENERGIA:");
+    DEBUG_PRINTF("   ⏱️ Runtime total: %lu s\n", energy_stats.total_runtime_ms / 1000);
+    DEBUG_PRINTF("   ⚡ Potência média: %.2f mW\n", energy_stats.average_power_mw);
+    DEBUG_PRINTF("   🔥 Potência pico: %.2f mW\n", energy_stats.peak_power_mw);
+    DEBUG_PRINTF("   🔋 Energia total: %.4f mWh\n", energy_stats.energy_consumed_mwh);
+    DEBUG_PRINTF("   😴 Deep sleeps: %lu\n", energy_stats.deep_sleep_count);
+    
+    float efficiency = (float)energy_stats.sleep_time_ms / energy_stats.total_runtime_ms * 100;
+    DEBUG_PRINTF("   📊 Eficiência sleep: %.1f%%\n", efficiency);
+}
